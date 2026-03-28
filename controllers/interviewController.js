@@ -6,6 +6,22 @@ const {
     continueInterview,
     generateSessionSummary,
 } = require("../services/geminiService");
+const { consumeGroqCallQuota } = require("../services/groqQuotaService");
+
+const consumeQuotaOrReject = async (res, userId) => {
+    const quota = await consumeGroqCallQuota(userId);
+
+    if (!quota.allowed) {
+        res.status(429).json({
+            success: false,
+            message: `Daily Groq limit reached. You can make up to ${quota.limit} AI calls per day.`,
+            quota,
+        });
+        return null;
+    }
+
+    return quota;
+};
 
 const ALLOWED_PROGRAMS = new Set([
     "javascript",
@@ -197,6 +213,9 @@ const startSession = async (req, res) => {
             session._id
         );
 
+        const quota = await consumeQuotaOrReject(res, req.user._id);
+        if (!quota) return;
+
         // ── Call Gemini with full past context ────────────────────────────
         const geminiResponse = await startInterview({
             user: req.user,
@@ -222,6 +241,7 @@ const startSession = async (req, res) => {
             turnId: turn._id,
             turnNumber: 1,
             question: geminiResponse.nextQuestion,
+            quota,
         });
     } catch (error) {
         console.error("startSession error:", error.message);
@@ -296,6 +316,9 @@ const submitAnswer = async (req, res) => {
             .filter((text) => typeof text === "string" && text.trim().length > 0)
             .map((text) => text.trim());
 
+        const quota = await consumeQuotaOrReject(res, req.user._id);
+        if (!quota) return;
+
         // ── Call Gemini: only the previous turn as history ────────────────
         const geminiResponse = await continueInterview({
             user: req.user,
@@ -369,6 +392,7 @@ const submitAnswer = async (req, res) => {
             turnId: nextTurn._id,
             turnNumber: nextTurn.turnNumber,
             isSessionComplete: false,
+            quota,
         });
     } catch (error) {
         console.error("submitAnswer error:", error.message);
@@ -386,6 +410,9 @@ const handleSessionComplete = async ({ res, session, geminiResponse, user }) => 
             const allTurns = await ConversationTurn.find({
                 sessionId: session._id,
             }).sort({ turnNumber: 1 });
+
+            const quota = await consumeQuotaOrReject(res, user._id);
+            if (!quota) return;
 
             sessionSummary = await generateSessionSummary({
                 user,
@@ -444,6 +471,9 @@ const endSession = async (req, res) => {
             turnNumber: 1,
         });
 
+        const quota = await consumeQuotaOrReject(res, req.user._id);
+        if (!quota) return;
+
         const sessionSummary = await generateSessionSummary({
             user: req.user,
             session,
@@ -468,6 +498,7 @@ const endSession = async (req, res) => {
             success: true,
             message: "Session ended.",
             sessionSummary: session.feedback,
+            quota,
         });
     } catch (error) {
         res.status(500).json({ success: false, message: error.message });
