@@ -2,6 +2,8 @@ const express = require("express");
 const mongoose = require("mongoose");
 const cookieParser = require("cookie-parser");
 const cors = require("cors");
+const jwt = require("jsonwebtoken");
+const rateLimit = require("express-rate-limit");
 require("dotenv").config();
 
 const authRoutes = require("./routes/authRoutes");
@@ -9,16 +11,102 @@ const interviewRoutes = require("./routes/interviewRoutes");
 const userRoutes = require("./routes/userRoutes");
 
 const app = express();
+app.set("trust proxy", 1);
+
+const parsePositiveInt = (value, fallback) => {
+  const parsed = Number.parseInt(value, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+};
+
+const getRequestIdentity = (req) => {
+  const authHeader = req.headers.authorization;
+  const bearerToken = authHeader?.startsWith("Bearer ")
+    ? authHeader.split(" ")[1]
+    : null;
+  const token = req.cookies?.token || bearerToken;
+
+  if (token && process.env.JWT_SECRET) {
+    try {
+      const decoded = jwt.verify(token, process.env.JWT_SECRET);
+      if (decoded?.id) return `user:${decoded.id}`;
+    } catch {
+      // Ignore invalid tokens and fallback to request metadata.
+    }
+  }
+
+  const email =
+    typeof req.body?.email === "string"
+      ? req.body.email.trim().toLowerCase()
+      : "";
+
+  if (email) return `email:${email}|ip:${req.ip}`;
+  return `ip:${req.ip}`;
+};
+
+const apiLimiter = rateLimit({
+  windowMs: parsePositiveInt(process.env.RATE_LIMIT_WINDOW_MS, 15 * 60 * 1000),
+  max: parsePositiveInt(process.env.RATE_LIMIT_MAX, 300),
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: getRequestIdentity,
+  handler: (req, res) => {
+    res.status(429).json({
+      success: false,
+      message: "Too many requests. Please try again shortly.",
+    });
+  },
+});
+
+const authLimiter = rateLimit({
+  windowMs: parsePositiveInt(
+    process.env.AUTH_RATE_LIMIT_WINDOW_MS,
+    15 * 60 * 1000
+  ),
+  max: parsePositiveInt(process.env.AUTH_RATE_LIMIT_MAX, 20),
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: getRequestIdentity,
+  handler: (req, res) => {
+    res.status(429).json({
+      success: false,
+      message: "Too many auth attempts. Please wait and try again.",
+    });
+  },
+});
+
+const allowedOrigins = [
+  ...(process.env.CLIENT_URL || "")
+    .split(",")
+    .map((value) => value.trim())
+    .filter(Boolean),
+  ...(process.env.CLIENT_URLS || "")
+    .split(",")
+    .map((value) => value.trim())
+    .filter(Boolean),
+  "http://localhost:3000",
+  "http://127.0.0.1:3000",
+];
+
+const corsOptions = {
+  origin: (origin, callback) => {
+    // Allow non-browser clients and same-origin requests with no Origin header.
+    if (!origin) return callback(null, true);
+
+    if (allowedOrigins.includes(origin)) {
+      return callback(null, true);
+    }
+
+    return callback(new Error(`CORS blocked for origin: ${origin}`));
+  },
+  credentials: true,
+};
 
 // ─── Middlewares ─────────────────────────────────────────────────────────────
 app.use(express.json());
 app.use(cookieParser());
-app.use(
-  cors({
-    origin: process.env.CLIENT_URL || "http://localhost:3000",
-    credentials: true,
-  })
-);
+app.use(cors(corsOptions));
+app.use("/api", apiLimiter);
+app.use("/api/auth", authLimiter);
 
 // ─── Routes ──────────────────────────────────────────────────────────────────
 app.use("/api/auth", authRoutes);
